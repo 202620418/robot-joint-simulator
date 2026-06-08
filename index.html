@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>로봇 관절 제어 실험 시뮬레이터</title>
+<style>
+  body{
+    font-family: Arial, "Malgun Gothic", sans-serif;
+    max-width: 1120px;
+    margin: 20px auto;
+    padding: 0 14px;
+    line-height: 1.55;
+  }
+  h1{font-size:24px;margin-bottom:4px;}
+  .notice{
+    background:#f5f5f5;
+    border-left:5px solid #666;
+    padding:10px 14px;
+    margin:10px 0 16px;
+  }
+  .layout{
+    display:grid;
+    grid-template-columns: 360px 1fr;
+    gap:18px;
+    align-items:start;
+  }
+  .panel{
+    border:1px solid #ccc;
+    border-radius:10px;
+    padding:12px;
+    background:white;
+  }
+  label{font-weight:bold;display:block;margin-top:10px;}
+  select,input[type=range],input[type=number]{width:100%;}
+  button{
+    padding:8px 12px;
+    margin:8px 4px 0 0;
+    border:1px solid #777;
+    border-radius:6px;
+    background:white;
+    cursor:pointer;
+  }
+  button:hover{background:#eee;}
+  canvas{
+    border:1px solid #aaa;
+    border-radius:8px;
+    width:100%;
+    background:#fff;
+  }
+  .result{
+    border:1px solid #ccc;
+    border-radius:10px;
+    padding:12px;
+    margin-top:12px;
+    background:#fafafa;
+  }
+  table{
+    border-collapse:collapse;
+    width:100%;
+    margin-top:12px;
+    font-size:14px;
+  }
+  th,td{
+    border:1px solid #ccc;
+    padding:6px;
+    text-align:center;
+  }
+  th{background:#f0f0f0;}
+  .small{font-size:13px;color:#444;}
+</style>
+</head>
+<body>
+<h1>유압식 vs 전기식 로봇 관절 제어 실험 시뮬레이터</h1>
+<div class="notice">
+  이 파일은 보고서용 <b>직접 조작형 시뮬레이터</b>이다. 실제 아틀라스 내부 데이터를 재현한 것이 아니라,
+  로봇 관절 하나가 목표 각도까지 움직이는 과정을 단순화하여 비교한다.
+  실행 버튼을 누르면 로봇 팔이 직접 움직이고, 실험 결과가 기록된다.
+</div>
+
+<div class="layout">
+  <div class="panel">
+    <h3>실험 조건 설정</h3>
+
+    <label>구동 방식 선택</label>
+    <select id="driveType" onchange="setPreset()">
+      <option value="hydraulic">유압식 모델</option>
+      <option value="electric">전기식 모델</option>
+      <option value="custom">직접 설정</option>
+    </select>
+
+    <label>목표 각도: <span id="targetText">90</span>°</label>
+    <input id="targetAngle" type="range" min="30" max="130" step="1" value="90" oninput="syncText()">
+
+    <label>반응 속도: <span id="speedText">5.0</span></label>
+    <input id="speed" type="range" min="1" max="8" step="0.1" value="5.0" oninput="manualMode(); syncText()">
+
+    <label>감쇠 정도: <span id="dampingText">0.28</span></label>
+    <input id="damping" type="range" min="0.10" max="0.98" step="0.01" value="0.28" oninput="manualMode(); syncText()">
+
+    <label>물체 무게 조건: <span id="loadText">1.0</span>배</label>
+    <input id="load" type="range" min="0.5" max="2.0" step="0.1" value="1.0" oninput="syncText()">
+
+    <button onclick="startExperiment()">실험 시작</button>
+    <button onclick="pauseExperiment()">일시정지</button>
+    <button onclick="resetArm()">초기화</button>
+    <button onclick="saveTrial()">현재 결과 기록</button>
+    <button onclick="downloadCSV()">기록 CSV 저장</button>
+
+    <p class="small">
+      사용 방법: 구동 방식을 고르고 실험 시작을 누른다. 로봇 팔이 목표 각도까지 움직이는 모습을 본 뒤,
+      현재 결과 기록 버튼을 누르면 표에 저장된다.
+    </p>
+  </div>
+
+  <div>
+    <canvas id="simCanvas" width="720" height="520"></canvas>
+    <div class="result" id="resultBox">
+      아직 실험을 시작하지 않았다.
+    </div>
+  </div>
+</div>
+
+<table id="trialTable">
+  <thead>
+    <tr>
+      <th>번호</th>
+      <th>구동 방식</th>
+      <th>목표 각도</th>
+      <th>물체 무게</th>
+      <th>최대 초과각</th>
+      <th>안정 시간</th>
+      <th>해석</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const canvas = document.getElementById("simCanvas");
+const ctx = canvas.getContext("2d");
+
+let running = false;
+let t = 0;
+let currentAngle = 0;
+let maxAngle = 0;
+let stableTime = null;
+let lastData = null;
+let trials = [];
+let animationId = null;
+
+function syncText(){
+  document.getElementById("targetText").innerText = document.getElementById("targetAngle").value;
+  document.getElementById("speedText").innerText = Number(document.getElementById("speed").value).toFixed(1);
+  document.getElementById("dampingText").innerText = Number(document.getElementById("damping").value).toFixed(2);
+  document.getElementById("loadText").innerText = Number(document.getElementById("load").value).toFixed(1);
+}
+
+function manualMode(){
+  document.getElementById("driveType").value = "custom";
+}
+
+function setPreset(){
+  const type = document.getElementById("driveType").value;
+  if(type === "hydraulic"){
+    document.getElementById("speed").value = 5.0;
+    document.getElementById("damping").value = 0.28;
+  } else if(type === "electric"){
+    document.getElementById("speed").value = 3.0;
+    document.getElementById("damping").value = 0.85;
+  }
+  syncText();
+}
+
+function secondOrderStep(t, target, zeta, omega){
+  if(zeta >= 1) zeta = 0.999;
+  const wd = omega * Math.sqrt(1 - zeta*zeta);
+  const phi = Math.acos(zeta);
+  return target * (1 - (1/Math.sqrt(1-zeta*zeta)) * Math.exp(-zeta*omega*t) * Math.sin(wd*t + phi));
+}
+
+function driveName(){
+  const type = document.getElementById("driveType").value;
+  if(type === "hydraulic") return "유압식 모델";
+  if(type === "electric") return "전기식 모델";
+  return "직접 설정";
+}
+
+function startExperiment(){
+  t = 0;
+  currentAngle = 0;
+  maxAngle = 0;
+  stableTime = null;
+  running = true;
+  if(animationId) cancelAnimationFrame(animationId);
+  animate();
+}
+
+function pauseExperiment(){
+  running = false;
+}
+
+function resetArm(){
+  running = false;
+  t = 0;
+  currentAngle = 0;
+  maxAngle = 0;
+  stableTime = null;
+  lastData = null;
+  if(animationId) cancelAnimationFrame(animationId);
+  drawScene();
+  document.getElementById("resultBox").innerText = "초기화 완료. 실험 시작 버튼을 누르면 팔이 움직인다.";
+}
+
+function animate(){
+  if(!running) return;
+
+  const target = Number(document.getElementById("targetAngle").value);
+  const speed = Number(document.getElementById("speed").value);
+  const damping = Number(document.getElementById("damping").value);
+  const load = Number(document.getElementById("load").value);
+
+  // Load makes the response slower and slightly harder to settle.
+  const effectiveSpeed = speed / Math.sqrt(load);
+  const effectiveDamping = Math.max(0.10, damping - (load - 1.0) * 0.06);
+
+  currentAngle = secondOrderStep(t, target, effectiveDamping, effectiveSpeed);
+  maxAngle = Math.max(maxAngle, currentAngle);
+
+  const lower = target * 0.98;
+  const upper = target * 1.02;
+  if(stableTime === null && t > 0.5){
+    let ok = true;
+    for(let future = t; future <= 5; future += 0.1){
+      const a = secondOrderStep(future, target, effectiveDamping, effectiveSpeed);
+      if(a < lower || a > upper){ ok = false; break; }
+    }
+    if(ok) stableTime = t;
+  }
+
+  drawScene();
+
+  const overshoot = Math.max(0, maxAngle - target);
+  lastData = {
+    drive: driveName(),
+    target,
+    load,
+    overshoot,
+    stableTime,
+    angle: currentAngle
+  };
+  showResult();
+
+  t += 0.025;
+  if(t <= 5.0){
+    animationId = requestAnimationFrame(animate);
+  }else{
+    running = false;
+  }
+}
+
+function drawScene(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // floor
+  ctx.strokeStyle = "#333";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(60,430);
+  ctx.lineTo(660,430);
+  ctx.stroke();
+
+  // robot base/body
+  const baseX = 210;
+  const baseY = 340;
+  ctx.fillStyle = "#ddd";
+  ctx.strokeStyle = "#222";
+  ctx.lineWidth = 2;
+  ctx.fillRect(baseX-55, baseY-90, 110, 90);
+  ctx.strokeRect(baseX-55, baseY-90, 110, 90);
+
+  ctx.beginPath();
+  ctx.arc(baseX, baseY-105, 28, 0, Math.PI*2);
+  ctx.fillStyle = "#eee";
+  ctx.fill();
+  ctx.stroke();
+
+  // target line angle
+  const target = Number(document.getElementById("targetAngle").value);
+  const angleRadTarget = -target * Math.PI / 180;
+  const L1 = 150;
+  const L2 = 105;
+  const jointX = baseX;
+  const jointY = baseY-65;
+
+  ctx.strokeStyle = "#999";
+  ctx.setLineDash([6,4]);
+  ctx.beginPath();
+  ctx.moveTo(jointX, jointY);
+  ctx.lineTo(jointX + (L1+L2)*Math.cos(angleRadTarget), jointY + (L1+L2)*Math.sin(angleRadTarget));
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#666";
+  ctx.fillText("목표 각도", jointX + 170*Math.cos(angleRadTarget), jointY + 170*Math.sin(angleRadTarget)-8);
+
+  // arm
+  const angleRad = -currentAngle * Math.PI / 180;
+  const elbowX = jointX + L1*Math.cos(angleRad);
+  const elbowY = jointY + L1*Math.sin(angleRad);
+  const handX = elbowX + L2*Math.cos(angleRad);
+  const handY = elbowY + L2*Math.sin(angleRad);
+
+  ctx.strokeStyle = "#1f5faa";
+  ctx.lineWidth = 16;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(jointX, jointY);
+  ctx.lineTo(elbowX, elbowY);
+  ctx.lineTo(handX, handY);
+  ctx.stroke();
+
+  // joints
+  ctx.fillStyle = "#fff";
+  ctx.strokeStyle = "#1f5faa";
+  ctx.lineWidth = 4;
+  [ [jointX,jointY], [elbowX,elbowY], [handX,handY] ].forEach(p=>{
+    ctx.beginPath();
+    ctx.arc(p[0],p[1],12,0,Math.PI*2);
+    ctx.fill();
+    ctx.stroke();
+  });
+
+  // load object
+  const load = Number(document.getElementById("load").value);
+  ctx.fillStyle = "#c97800";
+  const boxSize = 22 + load*10;
+  ctx.fillRect(handX - boxSize/2, handY + 14, boxSize, boxSize);
+  ctx.strokeStyle = "#5c3700";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(handX - boxSize/2, handY + 14, boxSize, boxSize);
+
+  // angle display
+  ctx.fillStyle = "#000";
+  ctx.font = "18px Arial";
+  ctx.fillText(`현재 각도: ${currentAngle.toFixed(1)}°`, 40, 40);
+  ctx.fillText(`목표 각도: ${target.toFixed(0)}°`, 40, 68);
+  ctx.fillText(`시간: ${t.toFixed(2)}초`, 40, 96);
+  ctx.fillText(`구동 방식: ${driveName()}`, 40, 124);
+
+  // mini gauge
+  ctx.strokeStyle = "#ddd";
+  ctx.lineWidth = 12;
+  ctx.beginPath();
+  ctx.arc(575,145,70,Math.PI,Math.PI*2);
+  ctx.stroke();
+
+  ctx.strokeStyle = "#d97706";
+  ctx.lineWidth = 12;
+  ctx.beginPath();
+  const gaugeEnd = Math.PI + Math.min(currentAngle/140,1)*Math.PI;
+  ctx.arc(575,145,70,Math.PI,gaugeEnd);
+  ctx.stroke();
+
+  ctx.fillStyle = "#000";
+  ctx.font = "15px Arial";
+  ctx.fillText("관절 각도 게이지", 520, 235);
+}
+
+function showResult(){
+  if(!lastData) return;
+  const settleText = lastData.stableTime === null ? "아직 안정되지 않음" : `${lastData.stableTime.toFixed(2)}초`;
+  let interpretation = "";
+  if(lastData.overshoot > 10){
+    interpretation = "목표 각도를 크게 초과하여 제어가 거칠게 나타남.";
+  }else if(lastData.overshoot > 2){
+    interpretation = "목표 각도를 약간 초과하지만 비교적 안정됨.";
+  }else{
+    interpretation = "목표 각도에 부드럽고 정밀하게 접근함.";
+  }
+  document.getElementById("resultBox").innerHTML =
+    `<b>현재 실험 결과</b><br>
+    구동 방식: ${lastData.drive}<br>
+    목표 각도: ${lastData.target}° / 물체 무게 조건: ${lastData.load.toFixed(1)}배<br>
+    최대 초과각: ${lastData.overshoot.toFixed(1)}°<br>
+    안정 시간: ${settleText}<br>
+    해석: ${interpretation}`;
+}
+
+function saveTrial(){
+  if(!lastData){
+    alert("먼저 실험을 시작해 주세요.");
+    return;
+  }
+  let interpretation = "";
+  if(lastData.overshoot > 10){
+    interpretation = "목표 초과와 흔들림이 큼";
+  }else if(lastData.overshoot > 2){
+    interpretation = "약간 초과 후 안정";
+  }else{
+    interpretation = "부드럽고 정밀하게 접근";
+  }
+  trials.push({...lastData, interpretation});
+  fillTrialTable();
+}
+
+function fillTrialTable(){
+  const tbody = document.querySelector("#trialTable tbody");
+  tbody.innerHTML = "";
+  trials.forEach((tr, idx)=>{
+    const settle = tr.stableTime === null ? "미측정" : tr.stableTime.toFixed(2) + "초";
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td>${idx+1}</td>
+      <td>${tr.drive}</td>
+      <td>${tr.target}°</td>
+      <td>${tr.load.toFixed(1)}배</td>
+      <td>${tr.overshoot.toFixed(1)}°</td>
+      <td>${settle}</td>
+      <td>${tr.interpretation}</td>`;
+    tbody.appendChild(row);
+  });
+}
+
+function downloadCSV(){
+  if(trials.length === 0){
+    alert("저장된 실험 기록이 없습니다. 현재 결과 기록 버튼을 먼저 눌러 주세요.");
+    return;
+  }
+  let csv = "\uFEFF번호,구동 방식,목표 각도,물체 무게,최대 초과각,안정 시간,해석\n";
+  trials.forEach((tr, idx)=>{
+    const settle = tr.stableTime === null ? "미측정" : tr.stableTime.toFixed(2);
+    csv += `${idx+1},${tr.drive},${tr.target},${tr.load.toFixed(1)},${tr.overshoot.toFixed(1)},${settle},${tr.interpretation}\n`;
+  });
+  const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "robot_joint_simulator_trials.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+syncText();
+drawScene();
+</script>
+</body>
+</html>
